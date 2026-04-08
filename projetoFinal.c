@@ -6,7 +6,7 @@
 #include "pico/cyw43_arch.h"
 #include "lwip/tcp.h"
 
-
+//Declaração de variáveis globais para mandar dados ao html
 volatile int duty_cycle_G = 0;
 volatile int duty_cycle_B = 0;
 volatile int duty_cycle_R = 0;
@@ -50,11 +50,15 @@ void configurar_botoes(){
 
 }
 
+
+// Configurando pinos do ADC
 void configurar_eixoXY(){
     adc_gpio_init(PINO_X);
     adc_gpio_init(PINO_Y);
 }
 
+
+// Configurando pinos dos leds que utilizaram PWM
 void configurar_leds(unsigned int slice_num_G, unsigned int slice_num_B){
     gpio_set_function(PWM_PIN_G, GPIO_FUNC_PWM);
     gpio_set_function(PWM_PIN_B, GPIO_FUNC_PWM);
@@ -70,13 +74,14 @@ void configurar_leds(unsigned int slice_num_G, unsigned int slice_num_B){
 
 }
 
-char http_response[1024];
+//Configurando HTML e conectividade wifi
+char resposta_http[1024];
 
-char button1_message[50] = "Nenhum evento no botão 1";
-char button2_message[50] = "Nenhum evento no botão 2";
+char mensagemB1[100] = "Aguardando clique";
+char mensagemB2[100] = "Aguardando clique";
 
 void create_http_response() {
-    snprintf(http_response, sizeof(http_response),
+    snprintf(resposta_http, sizeof(resposta_http),
              "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n"
              "<!DOCTYPE html><html><head><meta charset=\"UTF-8\">"
              "<title>Monitor de Botões</title>"
@@ -97,8 +102,9 @@ void create_http_response() {
              "  <p><b>Botão A:</b> <span id='msg_b1'>%s</span></p>"
              "  <p><b>Botão B:</b> <span id='msg_b2'>%s</span></p>"
              "</body></html>\r\n",
-             button1_message, button2_message);
+             mensagemB1, mensagemB2);
 }
+
 static err_t http_callback(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err) {
     if (p == NULL) {
         tcp_close(tpcb);
@@ -109,7 +115,7 @@ static err_t http_callback(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_
 
     if (strstr(request, "GET /status")) {
         char status_raw[128];
-        snprintf(status_raw, sizeof(status_raw), "%s|%s", button1_message, button2_message);
+        snprintf(status_raw, sizeof(status_raw), "%s|%s", mensagemB1, mensagemB2);
 
         char response[256];
         // Adicionado Content-Length e removido um espaço extra
@@ -125,7 +131,7 @@ static err_t http_callback(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_
     } else {
         // Se for qualquer outra coisa (como carregar a página inicial), envia o HTML
         create_http_response();
-        tcp_write(tpcb, http_response, strlen(http_response), TCP_WRITE_FLAG_COPY);
+        tcp_write(tpcb, resposta_http, strlen(resposta_http), TCP_WRITE_FLAG_COPY);
     }
 
     pbuf_free(p);
@@ -158,6 +164,7 @@ static void start_http_server(void) {
     printf("Servidor HTTP rodando na porta 80...\n");
 }
 
+// Função para monitorar cliques nos botões
 void ligar_pinos_callback(uint gpio, uint32_t events){
 
     static uint32_t last_time = 0;
@@ -166,11 +173,11 @@ void ligar_pinos_callback(uint gpio, uint32_t events){
     last_time = current_time;
 
     if(gpio == PINO_BOTAO_A){
-        snprintf(button1_message, sizeof(button1_message), "RGB: %d, %d, %d", (duty_cycle_R*255)/4095, (duty_cycle_G*255)/4095, (duty_cycle_B*255)/4095);
+        snprintf(mensagemB1, sizeof(mensagemB1), "RGB: %d, %d, %d", (duty_cycle_R*255)/4095, (duty_cycle_G*255)/4095, (duty_cycle_B*255)/4095);
         printf("Botão 1 pressionado\n");
 
     }else if(gpio == PINO_BOTAO_B){
-        snprintf(button2_message, sizeof(button2_message), "RGB: %d, %d, %d", (duty_cycle_R*255)/4095, (duty_cycle_G*255)/4095, (duty_cycle_B*255)/4095);
+        snprintf(mensagemB2, sizeof(mensagemB2), "RGB: %d, %d, %d", (duty_cycle_R*255)/4095, (duty_cycle_G*255)/4095, (duty_cycle_B*255)/4095);
         printf("Botão 2 pressionado\n");
 
     }else if(gpio == PINO_BOTAO_J){
@@ -182,11 +189,16 @@ void ligar_pinos_callback(uint gpio, uint32_t events){
 int main()
 {
 
+    // iniciando biblioteca adc
     adc_init();
-
+    
+    // iniciando biblioteca stdio
     stdio_init_all();
 
+    // tempo para entrar no monitor serial
     sleep_ms(10000);
+
+    //Iniciar servidor
     printf("Iniciando servidor HTTP\n");
     if (cyw43_arch_init()) {
         printf("Erro ao inicializar o Wi-Fi\n");
@@ -209,6 +221,7 @@ int main()
 
     printf("Wi-Fi conectado!\n");
 
+    // Funções de configuração
     configurar_eixoXY();
 
     configurar_botoes();
@@ -219,6 +232,7 @@ int main()
 
     gpio_set_irq_enabled(PINO_BOTAO_J, GPIO_IRQ_EDGE_FALL, true);
     
+    // Definindo o slice do gpio para o PWM; slice do led azul = slice do led vermelho
     int slice_num_G = pwm_gpio_to_slice_num(PWM_PIN_G);
     int slice_num_B = pwm_gpio_to_slice_num(PWM_PIN_B);
     
@@ -229,17 +243,19 @@ int main()
 
     start_http_server();
 
-
     while (true) {
 
-        cyw43_arch_poll();  // Necessário para manter o Wi-Fi ativo
+        // Mantém wifi ativo
+        cyw43_arch_poll();
 
+        // leitura do adc
         adc_select_input(1); 
         uint16_t vrx_value = adc_read(); 
 
         adc_select_input(0); 
         uint16_t vry_value = adc_read();
         
+        //Atribuição de valores
         duty_cycle_G = vrx_value;
         duty_cycle_B = vry_value;
         duty_cycle_R = 4095 - vrx_value;
@@ -249,13 +265,8 @@ int main()
         if (duty_cycle_R < 500) duty_cycle_R = 0;
 
         pwm_set_gpio_level(PWM_PIN_G, (duty_cycle_G*WRAP/4095));
-        // printf("Duty Cycle: %d%%\n ", (duty_cycle_G * 100)/8190);
         pwm_set_gpio_level(PWM_PIN_B, (duty_cycle_B*WRAP/4095));
-        // printf("Duty Cycle: %d%%\n ", (duty_cycle_B * 100)/4095);
         pwm_set_gpio_level(PWM_PIN_R, (duty_cycle_R*WRAP/4095));
-        // printf("Duty Cycle: %d%%\n ", (duty_cycle_R * 100)/4095);
-
-        // printf("VRX: %u, VRY: %u\n", vrx_value, vry_value);
 
         sleep_ms(50);
     }
