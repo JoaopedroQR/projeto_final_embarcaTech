@@ -57,7 +57,7 @@ target_include_directories(projetoFinal PRIVATE
 
 # Add any user requested libraries
 target_link_libraries(projetoFinal 
-        
+        pico_cyw43_arch_lwip_threadsafe_background
         )
 
 pico_add_extra_outputs(projetoFinal)

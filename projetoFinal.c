@@ -3,6 +3,17 @@
 #include "pico/stdlib.h"
 #include "hardware/adc.h"
 #include "hardware/pwm.h"
+#include "pico/cyw43_arch.h"
+#include "lwip/tcp.h"
+
+
+volatile int duty_cycle_G = 0;
+volatile int duty_cycle_B = 0;
+volatile int duty_cycle_R = 0;
+
+//Configurações wifi
+#define WIFI_SSID "REDEWIFI"
+#define WIFI_PASS "SENHA"
 
 // definindo GPIO dos botões
 #define PINO_BOTAO_A 5
@@ -14,6 +25,7 @@
 #define PWM_PIN_B 12
 #define PWM_PIN_R 13
 
+// Variáveis do PWM:
 int WRAP = 50000; // RESOLUÇÃO, QUANTO MAIOR, MAIOR A POSSIBILIDADE DE VALORES MAIS EXATOS.
 int duty_cycle = 0; // DEFINE O NIVEL DO DUTY CYCLE
 int clk_div = 50;
@@ -21,11 +33,6 @@ int clk_div = 50;
 // definindo GPIO dos eixos X e Y
 #define PINO_X 26
 #define PINO_Y 27
-
-
-volatile bool azul_ligado = false;
-volatile bool verde_ligado = false;
-volatile bool vermelho_ligado = false;
 
 void configurar_botoes(){
     // Configurando botão A
@@ -63,33 +70,113 @@ void configurar_leds(unsigned int slice_num_G, unsigned int slice_num_B){
 
 }
 
-void ligar_pinos_callback(uint gpio, uint32_t events){
-    if(gpio == PINO_BOTAO_A){
-        // sleep_ms(50);
-        //     if(gpio_get(PINO_BOTAO_A) == 0){
-        //         while(gpio_get(PINO_BOTAO_A) == 0){
-        //             sleep_ms(50);
-        //         }
-        //     }
-        // duty_cycle_R += 20;
-        // if(duty_cycle_R == 100){
-        //     duty_cycle_R = 0;
-        // }
-        
-        // pwm_set_gpio_level(PWM_PIN_R, (duty_cycle_R*WRAP/100));
-    }else if(gpio == PINO_BOTAO_B){
-        // bool estado_atual = gpio_get(PINO_LED_B);
-        // gpio_put(PINO_LED_B, !estado_atual);
+char http_response[1024];
 
-        // azul_ligado = true;
-    }else if(gpio == PINO_BOTAO_J){
-        // bool estado_atual = gpio_get(PINO_LED_R);
-        // gpio_put(PINO_LED_R, !estado_atual);
+char button1_message[50] = "Nenhum evento no botão 1";
+char button2_message[50] = "Nenhum evento no botão 2";
 
-        // vermelho_ligado = true;
+void create_http_response() {
+    snprintf(http_response, sizeof(http_response),
+             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n"
+             "<!DOCTYPE html><html><head><meta charset=\"UTF-8\">"
+             "<title>Monitor de Botões</title>"
+             "<script>"
+             "  function buscarStatus() {"
+             "    fetch('/status?t=' + new Date().getTime()).then(res => res.text()).then(data => {"
+             "      const partes = data.split('|');"
+             "      if(partes.length >= 2) {"
+             "        document.getElementById('msg_b1').innerText = partes[0];"
+             "        document.getElementById('msg_b2').innerText = partes[1];"
+             "      }"
+             "    }).catch(err => console.error(err));"
+             "  }"
+             "  setInterval(buscarStatus, 500);" // O navegador checa o servidor a cada 0.5s
+             "</script>"
+             "</head><body>"
+             "  <h1>Estado dos Botões</h1>"
+             "  <p><b>Botão A:</b> <span id='msg_b1'>%s</span></p>"
+             "  <p><b>Botão B:</b> <span id='msg_b2'>%s</span></p>"
+             "</body></html>\r\n",
+             button1_message, button2_message);
+}
+static err_t http_callback(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err) {
+    if (p == NULL) {
+        tcp_close(tpcb);
+        return ERR_OK;
     }
+
+    char *request = (char *)p->payload;
+
+    if (strstr(request, "GET /status")) {
+        char status_raw[128];
+        snprintf(status_raw, sizeof(status_raw), "%s|%s", button1_message, button2_message);
+
+        char response[256];
+        // Adicionado Content-Length e removido um espaço extra
+        snprintf(response, sizeof(response),
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/plain\r\n"
+                "Content-Length: %d\r\n"
+                "Connection: close\r\n\r\n"
+                "%s",
+                (int)strlen(status_raw), status_raw);
+
+        tcp_write(tpcb, response, strlen(response), TCP_WRITE_FLAG_COPY);
+    } else {
+        // Se for qualquer outra coisa (como carregar a página inicial), envia o HTML
+        create_http_response();
+        tcp_write(tpcb, http_response, strlen(http_response), TCP_WRITE_FLAG_COPY);
+    }
+
+    pbuf_free(p);
+    return ERR_OK;
 }
 
+
+static err_t connection_callback(void *arg, struct tcp_pcb *newpcb, err_t err) {
+    tcp_recv(newpcb, http_callback);  // Associa o callback HTTP
+    return ERR_OK;
+}
+
+// setup do servidor TCP
+static void start_http_server(void) {
+    struct tcp_pcb *pcb = tcp_new();
+    if (!pcb) {
+        printf("Erro ao criar PCB\n");
+        return;
+    }
+
+    // Liga o servidor na porta 80
+    if (tcp_bind(pcb, IP_ADDR_ANY, 80) != ERR_OK) {
+        printf("Erro ao ligar o servidor na porta 80\n");
+        return;
+    }
+
+    pcb = tcp_listen(pcb);  // Coloca o PCB em modo de escuta
+    tcp_accept(pcb, connection_callback);  // Associa o callback de conexão
+
+    printf("Servidor HTTP rodando na porta 80...\n");
+}
+
+void ligar_pinos_callback(uint gpio, uint32_t events){
+
+    static uint32_t last_time = 0;
+    uint32_t current_time = to_ms_since_boot(get_absolute_time());
+    if (current_time - last_time < 200) return;
+    last_time = current_time;
+
+    if(gpio == PINO_BOTAO_A){
+        snprintf(button1_message, sizeof(button1_message), "RGB: %d, %d, %d", (duty_cycle_R*255)/4095, (duty_cycle_G*255)/4095, (duty_cycle_B*255)/4095);
+        printf("Botão 1 pressionado\n");
+
+    }else if(gpio == PINO_BOTAO_B){
+        snprintf(button2_message, sizeof(button2_message), "RGB: %d, %d, %d", (duty_cycle_R*255)/4095, (duty_cycle_G*255)/4095, (duty_cycle_B*255)/4095);
+        printf("Botão 2 pressionado\n");
+
+    }else if(gpio == PINO_BOTAO_J){
+
+    }
+}
 
 
 int main()
@@ -98,6 +185,29 @@ int main()
     adc_init();
 
     stdio_init_all();
+
+    sleep_ms(10000);
+    printf("Iniciando servidor HTTP\n");
+    if (cyw43_arch_init()) {
+        printf("Erro ao inicializar o Wi-Fi\n");
+        return 1;
+    }
+
+    cyw43_arch_enable_sta_mode();
+    printf("Conectando ao Wi-Fi...\n");
+
+
+    if (cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASS, CYW43_AUTH_WPA2_AES_PSK, 10000)) {
+        printf("Falha ao conectar ao Wi-Fi\n");
+        return 1;
+    }else {
+        printf("Connected.\n");
+        // Read the ip address in a human readable way
+        uint8_t *ip_address = (uint8_t*)&(cyw43_state.netif[0].ip_addr.addr);
+        printf("Endereço IP %d.%d.%d.%d\n", ip_address[0], ip_address[1], ip_address[2], ip_address[3]);
+    }
+
+    printf("Wi-Fi conectado!\n");
 
     configurar_eixoXY();
 
@@ -117,7 +227,12 @@ int main()
     pwm_set_enabled(slice_num_G, true);
     pwm_set_enabled(slice_num_B, true);
 
+    start_http_server();
+
+
     while (true) {
+
+        cyw43_arch_poll();  // Necessário para manter o Wi-Fi ativo
 
         adc_select_input(1); 
         uint16_t vrx_value = adc_read(); 
@@ -125,25 +240,26 @@ int main()
         adc_select_input(0); 
         uint16_t vry_value = adc_read();
         
-        int duty_cycle_G = vrx_value;
-        int duty_cycle_B = vry_value;
-        int duty_cycle_R = 4095 - vrx_value;
+        duty_cycle_G = vrx_value;
+        duty_cycle_B = vry_value;
+        duty_cycle_R = 4095 - vrx_value;
         if (duty_cycle_B > 3700) duty_cycle_G = 0;
         if (duty_cycle_G < 500) duty_cycle_G = 0;
         if (duty_cycle_B < 500) duty_cycle_B = 0;
         if (duty_cycle_R < 500) duty_cycle_R = 0;
 
         pwm_set_gpio_level(PWM_PIN_G, (duty_cycle_G*WRAP/4095));
-        printf("Duty Cycle: %d%%\n ", (duty_cycle_G * 100)/8190);
+        // printf("Duty Cycle: %d%%\n ", (duty_cycle_G * 100)/8190);
         pwm_set_gpio_level(PWM_PIN_B, (duty_cycle_B*WRAP/4095));
-        printf("Duty Cycle: %d%%\n ", (duty_cycle_B * 100)/4095);
+        // printf("Duty Cycle: %d%%\n ", (duty_cycle_B * 100)/4095);
         pwm_set_gpio_level(PWM_PIN_R, (duty_cycle_R*WRAP/4095));
-        printf("Duty Cycle: %d%%\n ", (duty_cycle_R * 100)/4095);
+        // printf("Duty Cycle: %d%%\n ", (duty_cycle_R * 100)/4095);
 
-        printf("VRX: %u, VRY: %u\n", vrx_value, vry_value);
+        // printf("VRX: %u, VRY: %u\n", vrx_value, vry_value);
 
         sleep_ms(50);
     }
 
+    cyw43_arch_deinit();
     return 0;
 }
