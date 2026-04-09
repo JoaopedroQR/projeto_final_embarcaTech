@@ -12,7 +12,7 @@ volatile int duty_cycle_B = 0;
 volatile int duty_cycle_R = 0;
 
 //Configurações wifi
-#define WIFI_SSID "REDEWIFI"
+#define WIFI_SSID "REDE"
 #define WIFI_PASS "SENHA"
 
 // definindo GPIO dos botões
@@ -33,6 +33,17 @@ int clk_div = 50;
 // definindo GPIO dos eixos X e Y
 #define PINO_X 26
 #define PINO_Y 27
+
+#define NUM_CELLS 25
+
+// Cor de cada célula (0xRRGGBB). -1 = sem cor atribuída
+volatile int32_t cell_colors[NUM_CELLS];
+
+// Índice da célula selecionada pelo browser (-1 = nenhuma)
+volatile int selected_cell = -1;
+
+// Flag: botão A foi pressionado → aplicar cor
+volatile bool apply_color_flag = false;
 
 void configurar_botoes(){
     // Configurando botão A
@@ -74,69 +85,140 @@ void configurar_leds(unsigned int slice_num_G, unsigned int slice_num_B){
 
 }
 
-//Configurando HTML e conectividade wifi
-char resposta_http[1024];
-
-char mensagemB1[100] = "Aguardando clique";
-char mensagemB2[100] = "Aguardando clique";
-
-void create_http_response() {
-    snprintf(resposta_http, sizeof(resposta_http),
-             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n"
-             "<!DOCTYPE html><html><head><meta charset=\"UTF-8\">"
-             "<title>Monitor de Botões</title>"
-             "<script>"
-             "  function buscarStatus() {"
-             "    fetch('/status?t=' + new Date().getTime()).then(res => res.text()).then(data => {"
-             "      const partes = data.split('|');"
-             "      if(partes.length >= 2) {"
-             "        document.getElementById('msg_b1').innerText = partes[0];"
-             "        document.getElementById('msg_b2').innerText = partes[1];"
-             "      }"
-             "    }).catch(err => console.error(err));"
-             "  }"
-             "  setInterval(buscarStatus, 500);" // O navegador checa o servidor a cada 0.5s
-             "</script>"
-             "</head><body>"
-             "  <h1>Estado dos Botões</h1>"
-             "  <p><b>Botão A:</b> <span id='msg_b1'>%s</span></p>"
-             "  <p><b>Botão B:</b> <span id='msg_b2'>%s</span></p>"
-             "</body></html>\r\n",
-             mensagemB1, mensagemB2);
+static void build_state_json(char *buf, int buflen) {
+    int pos = 0;
+    pos += snprintf(buf + pos, buflen - pos,
+        "{\"cells\":[");
+    for (int i = 0; i < NUM_CELLS; i++) {
+        int32_t c = cell_colors[i];
+        int cr = -1, cg = -1, cb2 = -1;
+        if (c >= 0) {
+            cr  = (c >> 16) & 0xFF;
+            cg  = (c >>  8) & 0xFF;
+            cb2 =  c        & 0xFF;
+        }
+        if (c < 0)
+            pos += snprintf(buf + pos, buflen - pos, "null");
+        else
+            pos += snprintf(buf + pos, buflen - pos, "{\"r\":%d,\"g\":%d,\"b\":%d}", cr, cg, cb2);
+        if (i < NUM_CELLS - 1)
+            pos += snprintf(buf + pos, buflen - pos, ",");
+    }
+    // Converte duty cycles (0–4095) para 0–255
+    int cur_r = (duty_cycle_R * 255) / 4095;
+    int cur_g = (duty_cycle_G * 255) / 4095;
+    int cur_b = (duty_cycle_B * 255) / 4095;
+    pos += snprintf(buf + pos, buflen - pos,
+        "],\"sel\":%d,\"cur_r\":%d,\"cur_g\":%d,\"cur_b\":%d}",
+        selected_cell, cur_r, cur_g, cur_b);
 }
 
+
+static const char *HTML_PAGE =
+"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n"
+"<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+"<title>Grade RGB</title>"
+"<style>"
+"body{font-family:sans-serif;display:flex;flex-direction:column;align-items:center;padding:20px;}"
+"#grid{display:grid;grid-template-columns:repeat(5,64px);gap:8px;margin:20px 0;}"
+".cell{width:64px;height:64px;border:2px solid #aaa;border-radius:6px;cursor:pointer;background:#eee;}"
+".cell.selected{border:3px solid #1a73e8;outline:2px solid #8ab4f8;}"
+"#swatch{width:48px;height:48px;border:1px solid #ccc;border-radius:6px;display:inline-block;vertical-align:middle;margin-right:12px;}"
+"#info{margin-top:10px;color:#555;font-size:14px;}"
+"</style>"
+"</head><body>"
+"<h2>Painel 5x5 para colorir</h2>"
+"<div id='grid'></div>"
+"<div style='display:flex;align-items:center;margin-bottom:8px;'>"
+"  <span id='swatch'></span>"
+"  <span id='rgb-val' style='font-size:18px;font-weight:bold;'></span>"
+"</div>"
+"<p id='info'>Clique num quadrado para selecioná-lo.</p>"
+"<script>"
+"let selectedIdx = -1;"
+
+/* Cria as 25 células */
+"(function buildGrid(){"
+"  const g = document.getElementById('grid');"
+"  for(let i=0;i<25;i++){"
+"    const d=document.createElement('div');"
+"    d.className='cell'; d.dataset.idx=i;"
+"    d.addEventListener('click',()=>selectCell(i,d));"
+"    g.appendChild(d);"
+"  }"
+"}());"
+
+/* Seleciona célula → notifica Pico via GET /select?i=N */
+"function selectCell(idx, el){"
+"  document.querySelectorAll('.cell').forEach(c=>c.classList.remove('selected'));"
+"  el.classList.add('selected');"
+"  selectedIdx=idx;"
+"  fetch('/select?i='+idx);"
+"  document.getElementById('info').textContent='Quadrado '+(idx+1)+' selecionado. Pressione o Botão A para colorir.';"
+"}"
+
+/* Polling a cada 300 ms */
+"function poll(){"
+"  fetch('/state?t='+Date.now()).then(r=>r.json()).then(d=>{"
+"    const cells=document.querySelectorAll('.cell');"
+"    d.cells.forEach((c,i)=>{"
+"      if(c) cells[i].style.background='rgb('+c.r+','+c.g+','+c.b+')';"
+"      else  cells[i].style.background='';"
+"    });"
+"    const sw=document.getElementById('swatch');"
+"    sw.style.background='rgb('+d.cur_r+','+d.cur_g+','+d.cur_b+')';"
+"    document.getElementById('rgb-val').textContent="
+"      ' R:'+d.cur_r+' G:'+d.cur_g+' B:'+d.cur_b;"
+"    if(d.sel>=0 && d.sel!==selectedIdx){"
+"      document.querySelectorAll('.cell').forEach(c=>c.classList.remove('selected'));"
+"      document.querySelectorAll('.cell')[d.sel].classList.add('selected');"
+"      selectedIdx=d.sel;"
+"    }"
+"  }).catch(()=>{});"
+"}"
+"setInterval(poll,300);"
+"</script></body></html>\r\n";
+
 static err_t http_callback(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err) {
-    if (p == NULL) {
-        tcp_close(tpcb);
-        return ERR_OK;
-    }
+    if (p == NULL) { tcp_close(tpcb); return ERR_OK; }
 
-    char *request = (char *)p->payload;
+    char *req = (char *)p->payload;
 
-    if (strstr(request, "GET /status")) {
-        char status_raw[128];
-        snprintf(status_raw, sizeof(status_raw), "%s|%s", mensagemB1, mensagemB2);
+    // ── NOVO: GET /select?i=N → atualiza célula selecionada ─────────────────
+    if (strncmp(req, "GET /select", 11) == 0) {
+        char *qi = strstr(req, "i=");
+        if (qi) {
+            int idx = atoi(qi + 2);
+            if (idx >= 0 && idx < NUM_CELLS)
+                selected_cell = idx;
+        }
+        const char *ok = "HTTP/1.1 204 No Content\r\n\r\n";
+        tcp_write(tpcb, ok, strlen(ok), TCP_WRITE_FLAG_COPY);
 
-        char response[256];
-        // Adicionado Content-Length e removido um espaço extra
-        snprintf(response, sizeof(response),
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: text/plain\r\n"
-                "Content-Length: %d\r\n"
-                "Connection: close\r\n\r\n"
-                "%s",
-                (int)strlen(status_raw), status_raw);
+    // ── NOVO: GET /state → devolve JSON com estado da grade ─────────────────
+    } else if (strncmp(req, "GET /state", 10) == 0) {
+        char json[700];
+        build_state_json(json, sizeof(json));
 
-        tcp_write(tpcb, response, strlen(response), TCP_WRITE_FLAG_COPY);
+        char header[128];
+        int jlen = strlen(json);
+        snprintf(header, sizeof(header),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: close\r\n\r\n", jlen);
+        tcp_write(tpcb, header, strlen(header), TCP_WRITE_FLAG_COPY);
+        tcp_write(tpcb, json,   jlen,           TCP_WRITE_FLAG_COPY);
+
     } else {
-        // Se for qualquer outra coisa (como carregar a página inicial), envia o HTML
-        create_http_response();
-        tcp_write(tpcb, resposta_http, strlen(resposta_http), TCP_WRITE_FLAG_COPY);
+        // Página principal
+        tcp_write(tpcb, HTML_PAGE, strlen(HTML_PAGE), TCP_WRITE_FLAG_COPY);
     }
 
     pbuf_free(p);
     return ERR_OK;
 }
+
 
 
 static err_t connection_callback(void *arg, struct tcp_pcb *newpcb, err_t err) {
@@ -164,24 +246,28 @@ static void start_http_server(void) {
     printf("Servidor HTTP rodando na porta 80...\n");
 }
 
-// Função para monitorar cliques nos botões
-void ligar_pinos_callback(uint gpio, uint32_t events){
-
+void ligar_pinos_callback(uint gpio, uint32_t events) {
     static uint32_t last_time = 0;
-    uint32_t current_time = to_ms_since_boot(get_absolute_time());
-    if (current_time - last_time < 200) return;
-    last_time = current_time;
+    uint32_t now = to_ms_since_boot(get_absolute_time());
+    if (now - last_time < 200) return;
+    last_time = now;
 
-    if(gpio == PINO_BOTAO_A){
-        snprintf(mensagemB1, sizeof(mensagemB1), "RGB: %d, %d, %d", (duty_cycle_R*255)/4095, (duty_cycle_G*255)/4095, (duty_cycle_B*255)/4095);
-        printf("Botão 1 pressionado\n");
-
+    if (gpio == PINO_BOTAO_A) {
+        // ── NOVO: aplica a cor atual à célula selecionada ────────────────────
+        if (selected_cell >= 0 && selected_cell < NUM_CELLS) {
+            int r = (duty_cycle_R * 255) / 4095;
+            int g = (duty_cycle_G * 255) / 4095;
+            int b = (duty_cycle_B * 255) / 4095;
+            cell_colors[selected_cell] = ((int32_t)r << 16) | ((int32_t)g << 8) | b;
+            printf("Celula %d colorida → RGB(%d,%d,%d)\n", selected_cell, r, g, b);
+        }
     }else if(gpio == PINO_BOTAO_B){
-        snprintf(mensagemB2, sizeof(mensagemB2), "RGB: %d, %d, %d", (duty_cycle_R*255)/4095, (duty_cycle_G*255)/4095, (duty_cycle_B*255)/4095);
-        printf("Botão 2 pressionado\n");
-
+        if (selected_cell >= 0 && selected_cell < NUM_CELLS) {
+            cell_colors[selected_cell] = -1;
+            printf("Celula %d BRANCA\n");
+        }
     }else if(gpio == PINO_BOTAO_J){
-
+        for (int i = 0; i < NUM_CELLS; i++) cell_colors[i] = -1;
     }
 }
 
@@ -197,6 +283,8 @@ int main()
 
     // tempo para entrar no monitor serial
     sleep_ms(10000);
+
+     for (int i = 0; i < NUM_CELLS; i++) cell_colors[i] = -1;
 
     //Iniciar servidor
     printf("Iniciando servidor HTTP\n");
